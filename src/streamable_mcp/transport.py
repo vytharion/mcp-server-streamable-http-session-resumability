@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, AsyncIterator
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from streamable_mcp.server import MCPServer
@@ -15,6 +15,7 @@ from streamable_mcp.sessions import (
     Session,
     SessionStore,
 )
+from streamable_mcp.streams import EventLogRegistry, SessionEventLog
 
 MCP_PATH = "/mcp"
 
@@ -23,32 +24,46 @@ INVALID_REQUEST = -32600
 
 INITIALIZE_METHOD = "initialize"
 
+SSE_MEDIA_TYPE = "text/event-stream"
+
 
 def create_app(
     server: MCPServer,
     store: SessionStore | None = None,
+    events: EventLogRegistry | None = None,
     path: str = MCP_PATH,
 ) -> Starlette:
     resolved_store: SessionStore = store if store is not None else InMemorySessionStore()
+    resolved_events = events if events is not None else EventLogRegistry()
 
     async def endpoint(request: Request) -> Response:
         if request.method == "POST":
-            return await _handle_post(server, resolved_store, request)
-        return await _handle_delete(resolved_store, request)
+            return await _handle_post(server, resolved_store, resolved_events, request)
+        return await _handle_delete(resolved_store, resolved_events, request)
 
     return Starlette(routes=[Route(path, endpoint, methods=["POST", "DELETE"])])
 
 
-async def _handle_delete(store: SessionStore, request: Request) -> Response:
+async def _handle_delete(
+    store: SessionStore,
+    events: EventLogRegistry,
+    request: Request,
+) -> Response:
     session_id = request.headers.get(SESSION_HEADER)
     if not session_id:
         return _http_error(400, INVALID_REQUEST, f"missing {SESSION_HEADER} header")
     if not store.delete(session_id):
         return _http_error(404, INVALID_REQUEST, "unknown session")
+    events.discard(session_id)
     return Response(status_code=204)
 
 
-async def _handle_post(server: MCPServer, store: SessionStore, request: Request) -> Response:
+async def _handle_post(
+    server: MCPServer,
+    store: SessionStore,
+    events: EventLogRegistry,
+    request: Request,
+) -> Response:
     content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
     if content_type != "application/json":
         return _http_error(415, PARSE_ERROR, "content-type must be application/json")
@@ -61,17 +76,19 @@ async def _handle_post(server: MCPServer, store: SessionStore, request: Request)
     session_id = request.headers.get(SESSION_HEADER)
 
     if isinstance(payload, dict):
-        return _dispatch_single(server, store, payload, session_id)
+        return await _dispatch_single(server, store, events, payload, session_id, request)
     if isinstance(payload, list):
         return _dispatch_batch(server, store, payload, session_id)
     return _http_error(400, INVALID_REQUEST, "payload must be an object or array")
 
 
-def _dispatch_single(
+async def _dispatch_single(
     server: MCPServer,
     store: SessionStore,
+    events: EventLogRegistry,
     message: dict[str, Any],
     session_id: str | None,
+    request: Request,
 ) -> Response:
     if _is_initialize(message):
         session = store.create()
@@ -82,10 +99,47 @@ def _dispatch_single(
     if validated is None:
         return _missing_session_error(session_id)
 
+    if server.is_streaming(message):
+        return _stream_response(server, events, message, validated, request)
+
     reply = server.handle(message)
     if reply is None:
         return Response(status_code=202)
     return JSONResponse(reply)
+
+
+def _stream_response(
+    server: MCPServer,
+    events: EventLogRegistry,
+    message: dict[str, Any],
+    session: Session,
+    request: Request,
+) -> Response:
+    if not _accepts_sse(request):
+        return _http_error(
+            406, INVALID_REQUEST, f"streaming methods require Accept: {SSE_MEDIA_TYPE}"
+        )
+    log = events.for_session(session.id)
+    frames = list(server.stream_messages(message))
+    body = _sse_body(frames, log)
+    headers = {
+        SESSION_HEADER: session.id,
+        "Cache-Control": "no-cache",
+    }
+    return StreamingResponse(body, media_type=SSE_MEDIA_TYPE, headers=headers)
+
+
+async def _sse_body(
+    frames: list[dict[str, Any]], log: SessionEventLog
+) -> AsyncIterator[bytes]:
+    for frame in frames:
+        event = log.append(frame)
+        yield event.encode()
+
+
+def _accepts_sse(request: Request) -> bool:
+    accept = request.headers.get("accept", "")
+    return SSE_MEDIA_TYPE in accept
 
 
 def _dispatch_batch(

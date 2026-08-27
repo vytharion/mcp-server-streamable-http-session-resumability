@@ -1,13 +1,35 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 from starlette.testclient import TestClient
 
 from streamable_mcp.server import PROTOCOL_VERSION, MCPServer, ServerInfo
 from streamable_mcp.sessions import SESSION_HEADER, InMemorySessionStore
+from streamable_mcp.streams import EventLogRegistry
 from streamable_mcp.transport import create_app
+
+
+def _echo_tool(message: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    params = message.get("params") or {}
+    text = (params.get("arguments") or {}).get("text", "")
+    yield {
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {"progress": 1, "total": 2},
+    }
+    yield {
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {"progress": 2, "total": 2},
+    }
+    yield {
+        "jsonrpc": "2.0",
+        "id": message.get("id"),
+        "result": {"content": [{"type": "text", "text": text}]},
+    }
 
 
 @pytest.fixture()
@@ -16,9 +38,24 @@ def store() -> InMemorySessionStore:
 
 
 @pytest.fixture()
-def client(store: InMemorySessionStore) -> Iterator[TestClient]:
-    server = MCPServer(info=ServerInfo(name="demo", version="0.1.0"))
-    with TestClient(create_app(server, store=store)) as test_client:
+def events() -> EventLogRegistry:
+    return EventLogRegistry()
+
+
+@pytest.fixture()
+def server() -> MCPServer:
+    instance = MCPServer(info=ServerInfo(name="demo", version="0.1.0"))
+    instance.register_stream_tool("echo", _echo_tool)
+    return instance
+
+
+@pytest.fixture()
+def client(
+    server: MCPServer,
+    store: InMemorySessionStore,
+    events: EventLogRegistry,
+) -> Iterator[TestClient]:
+    with TestClient(create_app(server, store=store, events=events)) as test_client:
         yield test_client
 
 
@@ -254,3 +291,172 @@ def test_scalar_payload_is_rejected_as_invalid_request(client: TestClient) -> No
     assert response.status_code == 400
     body = response.json()
     assert body["error"]["code"] == -32600
+
+
+def _parse_sse_frames(raw: bytes) -> list[dict[str, str]]:
+    text = raw.decode("utf-8")
+    frames: list[dict[str, str]] = []
+    for chunk in text.split("\n\n"):
+        stripped = chunk.strip("\n")
+        if not stripped:
+            continue
+        parsed: dict[str, str] = {}
+        for line in stripped.splitlines():
+            key, _, value = line.partition(": ")
+            parsed[key] = value
+        frames.append(parsed)
+    return frames
+
+
+def test_tools_call_streams_sse_with_monotonic_event_ids(
+    client: TestClient,
+    events: EventLogRegistry,
+) -> None:
+    session_id = _initialize(client)
+
+    response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": "hi"}},
+        },
+        headers={
+            SESSION_HEADER: session_id,
+            "Accept": "application/json, text/event-stream",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers[SESSION_HEADER] == session_id
+
+    frames = _parse_sse_frames(response.content)
+    assert [frame["id"] for frame in frames] == ["1", "2", "3"]
+
+    log = events.get(session_id)
+    assert log is not None
+    assert len(log) == 3
+    assert log.snapshot()[-1].data["id"] == 11
+    assert log.snapshot()[-1].data["result"]["content"][0]["text"] == "hi"
+
+
+def test_streaming_tool_call_without_sse_accept_returns_406(client: TestClient) -> None:
+    session_id = _initialize(client)
+
+    response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": "hi"}},
+        },
+        headers={SESSION_HEADER: session_id, "Accept": "application/json"},
+    )
+
+    assert response.status_code == 406
+    body = response.json()
+    assert body["error"]["code"] == -32600
+    assert "text/event-stream" in body["error"]["message"]
+
+
+def test_streaming_tool_call_without_session_returns_400(client: TestClient) -> None:
+    response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": "hi"}},
+        },
+        headers={"Accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == -32600
+    assert SESSION_HEADER in body["error"]["message"]
+
+
+def test_streaming_tool_call_with_unknown_session_returns_404(client: TestClient) -> None:
+    response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": "hi"}},
+        },
+        headers={SESSION_HEADER: "not-a-session", "Accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_unknown_tool_still_streams_error_frame(client: TestClient) -> None:
+    session_id = _initialize(client)
+
+    response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "ghost"},
+        },
+        headers={SESSION_HEADER: session_id, "Accept": "application/json"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    body = response.json()
+    assert body["error"]["code"] == -32601
+
+
+def test_event_ids_stay_monotonic_across_two_streams(
+    client: TestClient,
+    events: EventLogRegistry,
+) -> None:
+    session_id = _initialize(client)
+
+    for request_id in (21, 22):
+        response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": "echo", "arguments": {"text": "x"}},
+            },
+            headers={SESSION_HEADER: session_id, "Accept": "text/event-stream"},
+        )
+        assert response.status_code == 200
+
+    log = events.get(session_id)
+    assert log is not None
+    assert [event.id for event in log.snapshot()] == [1, 2, 3, 4, 5, 6]
+
+
+def test_delete_evicts_event_log(
+    client: TestClient,
+    events: EventLogRegistry,
+) -> None:
+    session_id = _initialize(client)
+    client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 33,
+            "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": "hi"}},
+        },
+        headers={SESSION_HEADER: session_id, "Accept": "text/event-stream"},
+    )
+    assert events.get(session_id) is not None
+
+    response = client.delete("/mcp", headers={SESSION_HEADER: session_id})
+
+    assert response.status_code == 204
+    assert events.get(session_id) is None
