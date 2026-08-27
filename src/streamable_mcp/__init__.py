@@ -15,6 +15,12 @@ from streamable_mcp.streams import (
     SessionEventLog,
     SSEvent,
 )
+from streamable_mcp.tools import (
+    DEFAULT_DELAY_SECONDS,
+    DEFAULT_STEPS,
+    MAX_STEPS,
+    make_slow_counter_tool,
+)
 from streamable_mcp.transport import LAST_EVENT_ID_HEADER, MCP_PATH, create_app
 
 __all__ = [
@@ -32,4 +38,8 @@ __all__ = [
     "SSEvent",
     "SessionEventLog",
     "EventLogRegistry",
+    "make_slow_counter_tool",
+    "DEFAULT_STEPS",
+    "DEFAULT_DELAY_SECONDS",
+    "MAX_STEPS",
 ]

@@ -10,6 +10,7 @@ from starlette.testclient import TestClient
 from streamable_mcp.server import PROTOCOL_VERSION, MCPServer, ServerInfo
 from streamable_mcp.sessions import SESSION_HEADER, InMemorySessionStore
 from streamable_mcp.streams import EventLogRegistry
+from streamable_mcp.tools import make_slow_counter_tool
 from streamable_mcp.transport import LAST_EVENT_ID_HEADER, create_app
 
 
@@ -661,3 +662,191 @@ def test_get_does_not_mutate_event_log(
     after = [event.id for event in events.for_session(session_id).snapshot()]
 
     assert before == after == [1, 2, 3]
+
+
+def _build_slow_counter_client(
+    sleep_calls: list[float] | None = None,
+) -> tuple[TestClient, EventLogRegistry, InMemorySessionStore]:
+    def sleep(seconds: float) -> None:
+        if sleep_calls is not None:
+            sleep_calls.append(seconds)
+
+    server = MCPServer(info=ServerInfo(name="demo", version="0.1.0"))
+    server.register_stream_tool("slow_counter", make_slow_counter_tool(sleep=sleep))
+    store = InMemorySessionStore()
+    events = EventLogRegistry()
+    return TestClient(create_app(server, store=store, events=events)), events, store
+
+
+def test_slow_counter_streams_all_ticks_and_final_result_over_sse() -> None:
+    test_client, events, _ = _build_slow_counter_client()
+
+    with test_client as client:
+        session_id = _initialize(client)
+
+        response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 700,
+                "method": "tools/call",
+                "params": {
+                    "name": "slow_counter",
+                    "arguments": {"steps": 4, "delay": 0},
+                },
+            },
+            headers={
+                SESSION_HEADER: session_id,
+                "Accept": "text/event-stream",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+
+        frames = _parse_sse_frames(response.content)
+        assert [frame["id"] for frame in frames] == ["1", "2", "3", "4", "5"]
+
+        payloads = [json.loads(frame["data"]) for frame in frames]
+        assert [payload["params"]["progress"] for payload in payloads[:4]] == [1, 2, 3, 4]
+        assert payloads[-1]["id"] == 700
+        assert payloads[-1]["result"]["content"][0]["text"] == "counted to 4"
+
+        log = events.get(session_id)
+        assert log is not None
+        assert len(log) == 5
+
+
+def test_slow_counter_stream_populates_event_log_frame_by_frame() -> None:
+    test_client, events, _ = _build_slow_counter_client()
+
+    with test_client as client:
+        session_id = _initialize(client)
+
+        with client.stream(
+            "POST",
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 800,
+                "method": "tools/call",
+                "params": {
+                    "name": "slow_counter",
+                    "arguments": {"steps": 3, "delay": 0},
+                },
+            },
+            headers={
+                SESSION_HEADER: session_id,
+                "Accept": "text/event-stream",
+            },
+        ) as response:
+            assert response.status_code == 200
+            observed_lengths: list[int] = []
+            frame_bytes = b""
+            for chunk in response.iter_bytes():
+                frame_bytes += chunk
+                if frame_bytes.endswith(b"\n\n"):
+                    log = events.get(session_id)
+                    assert log is not None
+                    observed_lengths.append(len(log))
+
+        assert observed_lengths[-1] == 4
+        assert observed_lengths == sorted(observed_lengths)
+
+
+def test_slow_counter_replay_via_get_reissues_missed_frames(
+) -> None:
+    test_client, events, _ = _build_slow_counter_client()
+
+    with test_client as client:
+        session_id = _initialize(client)
+        client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 900,
+                "method": "tools/call",
+                "params": {
+                    "name": "slow_counter",
+                    "arguments": {"steps": 5, "delay": 0},
+                },
+            },
+            headers={
+                SESSION_HEADER: session_id,
+                "Accept": "text/event-stream",
+            },
+        )
+
+        response = client.get(
+            "/mcp",
+            headers={
+                SESSION_HEADER: session_id,
+                "Accept": "text/event-stream",
+                LAST_EVENT_ID_HEADER: "2",
+            },
+        )
+
+        assert response.status_code == 200
+        frames = _parse_sse_frames(response.content)
+        assert [frame["id"] for frame in frames] == ["3", "4", "5", "6"]
+
+        final_payload = json.loads(frames[-1]["data"])
+        assert final_payload["id"] == 900
+        assert final_payload["result"]["content"][0]["text"] == "counted to 5"
+
+
+def test_slow_counter_forwards_progress_token_from_meta_over_the_wire() -> None:
+    test_client, _events, _ = _build_slow_counter_client()
+
+    with test_client as client:
+        session_id = _initialize(client)
+
+        response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1000,
+                "method": "tools/call",
+                "params": {
+                    "name": "slow_counter",
+                    "arguments": {"steps": 2, "delay": 0},
+                    "_meta": {"progressToken": "sess-42"},
+                },
+            },
+            headers={
+                SESSION_HEADER: session_id,
+                "Accept": "text/event-stream",
+            },
+        )
+
+        assert response.status_code == 200
+        frames = _parse_sse_frames(response.content)
+        payloads = [json.loads(frame["data"]) for frame in frames]
+        assert payloads[0]["params"]["progressToken"] == "sess-42"
+        assert payloads[1]["params"]["progressToken"] == "sess-42"
+
+
+def test_slow_counter_sleep_hook_is_invoked_between_yields() -> None:
+    calls: list[float] = []
+    test_client, _events, _ = _build_slow_counter_client(sleep_calls=calls)
+
+    with test_client as client:
+        session_id = _initialize(client)
+        client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1100,
+                "method": "tools/call",
+                "params": {
+                    "name": "slow_counter",
+                    "arguments": {"steps": 3, "delay": 0.01},
+                },
+            },
+            headers={
+                SESSION_HEADER: session_id,
+                "Accept": "text/event-stream",
+            },
+        )
+
+    assert calls == [0.01, 0.01]

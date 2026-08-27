@@ -151,8 +151,7 @@ def _stream_response(
             406, INVALID_REQUEST, f"streaming methods require Accept: {SSE_MEDIA_TYPE}"
         )
     log = events.for_session(session.id)
-    frames = list(server.stream_messages(message))
-    body = _sse_body(frames, log)
+    body = _sse_body(server.stream_messages(message), log)
     headers = {
         SESSION_HEADER: session.id,
         "Cache-Control": "no-cache",
@@ -161,7 +160,7 @@ def _stream_response(
 
 
 async def _sse_body(
-    frames: list[dict[str, Any]], log: SessionEventLog
+    frames: Iterable[dict[str, Any]], log: SessionEventLog
 ) -> AsyncIterator[bytes]:
     for frame in frames:
         event = log.append(frame)
