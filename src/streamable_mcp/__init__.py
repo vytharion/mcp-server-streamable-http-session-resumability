@@ -1,3 +1,9 @@
+from streamable_mcp.client import (
+    DropResumeTranscript,
+    ScriptedClient,
+    SSEFrame,
+    run_drop_and_resume,
+)
 from streamable_mcp.server import (
     PROTOCOL_VERSION,
     MCPServer,
@@ -42,4 +48,8 @@ __all__ = [
     "DEFAULT_STEPS",
     "DEFAULT_DELAY_SECONDS",
     "MAX_STEPS",
+    "ScriptedClient",
+    "SSEFrame",
+    "DropResumeTranscript",
+    "run_drop_and_resume",
 ]
