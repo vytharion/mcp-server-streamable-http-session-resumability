@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterable
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -15,9 +15,11 @@ from streamable_mcp.sessions import (
     Session,
     SessionStore,
 )
-from streamable_mcp.streams import EventLogRegistry, SessionEventLog
+from streamable_mcp.streams import EventLogRegistry, SessionEventLog, SSEvent
 
 MCP_PATH = "/mcp"
+
+LAST_EVENT_ID_HEADER = "Last-Event-ID"
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -39,9 +41,13 @@ def create_app(
     async def endpoint(request: Request) -> Response:
         if request.method == "POST":
             return await _handle_post(server, resolved_store, resolved_events, request)
+        if request.method == "GET":
+            return await _handle_get(resolved_store, resolved_events, request)
         return await _handle_delete(resolved_store, resolved_events, request)
 
-    return Starlette(routes=[Route(path, endpoint, methods=["POST", "DELETE"])])
+    return Starlette(
+        routes=[Route(path, endpoint, methods=["POST", "GET", "DELETE"])]
+    )
 
 
 async def _handle_delete(
@@ -56,6 +62,31 @@ async def _handle_delete(
         return _http_error(404, INVALID_REQUEST, "unknown session")
     events.discard(session_id)
     return Response(status_code=204)
+
+
+async def _handle_get(
+    store: SessionStore,
+    events: EventLogRegistry,
+    request: Request,
+) -> Response:
+    session_id = request.headers.get(SESSION_HEADER)
+    validated = _resolve_session(store, session_id)
+    if validated is None:
+        return _missing_session_error(session_id)
+    if not _accepts_sse(request):
+        return _http_error(
+            406, INVALID_REQUEST, f"resumption requires Accept: {SSE_MEDIA_TYPE}"
+        )
+    cursor = _parse_last_event_id(request.headers.get(LAST_EVENT_ID_HEADER))
+    log = events.for_session(validated.id)
+    frames = log.since(cursor)
+    headers = {
+        SESSION_HEADER: validated.id,
+        "Cache-Control": "no-cache",
+    }
+    return StreamingResponse(
+        _replay_body(frames), media_type=SSE_MEDIA_TYPE, headers=headers
+    )
 
 
 async def _handle_post(
@@ -135,6 +166,21 @@ async def _sse_body(
     for frame in frames:
         event = log.append(frame)
         yield event.encode()
+
+
+async def _replay_body(frames: Iterable[SSEvent]) -> AsyncIterator[bytes]:
+    for event in frames:
+        yield event.encode()
+
+
+def _parse_last_event_id(raw: str | None) -> int:
+    if not raw:
+        return 0
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return 0
+    return value if value > 0 else 0
 
 
 def _accepts_sse(request: Request) -> bool:

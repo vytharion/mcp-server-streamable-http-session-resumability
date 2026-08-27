@@ -15,7 +15,7 @@ from streamable_mcp.streams import (
     SessionEventLog,
     SSEvent,
 )
-from streamable_mcp.transport import MCP_PATH, create_app
+from streamable_mcp.transport import LAST_EVENT_ID_HEADER, MCP_PATH, create_app
 
 __all__ = [
     "MCPServer",
@@ -23,6 +23,7 @@ __all__ = [
     "StreamingTool",
     "PROTOCOL_VERSION",
     "MCP_PATH",
+    "LAST_EVENT_ID_HEADER",
     "create_app",
     "SESSION_HEADER",
     "Session",

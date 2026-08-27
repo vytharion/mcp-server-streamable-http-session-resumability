@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from typing import Any
 
@@ -9,7 +10,7 @@ from starlette.testclient import TestClient
 from streamable_mcp.server import PROTOCOL_VERSION, MCPServer, ServerInfo
 from streamable_mcp.sessions import SESSION_HEADER, InMemorySessionStore
 from streamable_mcp.streams import EventLogRegistry
-from streamable_mcp.transport import create_app
+from streamable_mcp.transport import LAST_EVENT_ID_HEADER, create_app
 
 
 def _echo_tool(message: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -196,10 +197,13 @@ def test_batch_containing_initialize_is_rejected(client: TestClient) -> None:
     assert "initialize" in body["error"]["message"]
 
 
-def test_get_on_mcp_endpoint_is_method_not_allowed(client: TestClient) -> None:
-    response = client.get("/mcp")
+def test_get_without_session_header_returns_400(client: TestClient) -> None:
+    response = client.get("/mcp", headers={"Accept": "text/event-stream"})
 
-    assert response.status_code == 405
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == -32600
+    assert SESSION_HEADER in body["error"]["message"]
 
 
 def test_delete_terminates_session(client: TestClient, store: InMemorySessionStore) -> None:
@@ -460,3 +464,200 @@ def test_delete_evicts_event_log(
 
     assert response.status_code == 204
     assert events.get(session_id) is None
+
+
+def _stream_tool_call(
+    client: TestClient, session_id: str, request_id: int, text: str = "hi"
+) -> None:
+    response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": text}},
+        },
+        headers={SESSION_HEADER: session_id, "Accept": "text/event-stream"},
+    )
+    assert response.status_code == 200
+
+
+def test_get_with_unknown_session_returns_404(client: TestClient) -> None:
+    response = client.get(
+        "/mcp",
+        headers={SESSION_HEADER: "totally-made-up", "Accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == -32600
+
+
+def test_get_without_sse_accept_returns_406(client: TestClient) -> None:
+    session_id = _initialize(client)
+
+    response = client.get(
+        "/mcp",
+        headers={SESSION_HEADER: session_id, "Accept": "application/json"},
+    )
+
+    assert response.status_code == 406
+    body = response.json()
+    assert body["error"]["code"] == -32600
+    assert "text/event-stream" in body["error"]["message"]
+
+
+def test_get_without_last_event_id_replays_full_history(client: TestClient) -> None:
+    session_id = _initialize(client)
+    _stream_tool_call(client, session_id, request_id=100, text="first")
+    _stream_tool_call(client, session_id, request_id=101, text="second")
+
+    response = client.get(
+        "/mcp",
+        headers={SESSION_HEADER: session_id, "Accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers[SESSION_HEADER] == session_id
+
+    frames = _parse_sse_frames(response.content)
+    assert [frame["id"] for frame in frames] == ["1", "2", "3", "4", "5", "6"]
+
+
+def test_get_with_last_event_id_replays_only_events_after_cursor(
+    client: TestClient,
+) -> None:
+    session_id = _initialize(client)
+    _stream_tool_call(client, session_id, request_id=200, text="alpha")
+    _stream_tool_call(client, session_id, request_id=201, text="beta")
+
+    response = client.get(
+        "/mcp",
+        headers={
+            SESSION_HEADER: session_id,
+            "Accept": "text/event-stream",
+            LAST_EVENT_ID_HEADER: "3",
+        },
+    )
+
+    assert response.status_code == 200
+    frames = _parse_sse_frames(response.content)
+    assert [frame["id"] for frame in frames] == ["4", "5", "6"]
+
+
+def test_get_replays_final_result_payload_after_cursor(client: TestClient) -> None:
+    session_id = _initialize(client)
+    _stream_tool_call(client, session_id, request_id=42, text="resumed")
+
+    response = client.get(
+        "/mcp",
+        headers={
+            SESSION_HEADER: session_id,
+            "Accept": "text/event-stream",
+            LAST_EVENT_ID_HEADER: "2",
+        },
+    )
+
+    assert response.status_code == 200
+    frames = _parse_sse_frames(response.content)
+    assert [frame["id"] for frame in frames] == ["3"]
+    payload = json.loads(frames[0]["data"])
+    assert payload["id"] == 42
+    assert payload["result"]["content"][0]["text"] == "resumed"
+
+
+def test_get_with_cursor_at_end_returns_empty_stream(client: TestClient) -> None:
+    session_id = _initialize(client)
+    _stream_tool_call(client, session_id, request_id=300)
+
+    response = client.get(
+        "/mcp",
+        headers={
+            SESSION_HEADER: session_id,
+            "Accept": "text/event-stream",
+            LAST_EVENT_ID_HEADER: "3",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert _parse_sse_frames(response.content) == []
+
+
+def test_get_with_zero_cursor_replays_full_history(client: TestClient) -> None:
+    session_id = _initialize(client)
+    _stream_tool_call(client, session_id, request_id=400)
+
+    response = client.get(
+        "/mcp",
+        headers={
+            SESSION_HEADER: session_id,
+            "Accept": "text/event-stream",
+            LAST_EVENT_ID_HEADER: "0",
+        },
+    )
+
+    assert response.status_code == 200
+    frames = _parse_sse_frames(response.content)
+    assert [frame["id"] for frame in frames] == ["1", "2", "3"]
+
+
+def test_get_with_malformed_last_event_id_falls_back_to_full_replay(
+    client: TestClient,
+) -> None:
+    session_id = _initialize(client)
+    _stream_tool_call(client, session_id, request_id=500)
+
+    response = client.get(
+        "/mcp",
+        headers={
+            SESSION_HEADER: session_id,
+            "Accept": "text/event-stream",
+            LAST_EVENT_ID_HEADER: "not-a-number",
+        },
+    )
+
+    assert response.status_code == 200
+    frames = _parse_sse_frames(response.content)
+    assert [frame["id"] for frame in frames] == ["1", "2", "3"]
+
+
+def test_get_on_session_that_never_streamed_returns_empty_body(
+    client: TestClient,
+) -> None:
+    session_id = _initialize(client)
+
+    response = client.get(
+        "/mcp",
+        headers={SESSION_HEADER: session_id, "Accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert _parse_sse_frames(response.content) == []
+
+
+def test_get_does_not_mutate_event_log(
+    client: TestClient,
+    events: EventLogRegistry,
+) -> None:
+    session_id = _initialize(client)
+    _stream_tool_call(client, session_id, request_id=600)
+
+    before = [event.id for event in events.for_session(session_id).snapshot()]
+    client.get(
+        "/mcp",
+        headers={SESSION_HEADER: session_id, "Accept": "text/event-stream"},
+    )
+    client.get(
+        "/mcp",
+        headers={
+            SESSION_HEADER: session_id,
+            "Accept": "text/event-stream",
+            LAST_EVENT_ID_HEADER: "1",
+        },
+    )
+    after = [event.id for event in events.for_session(session_id).snapshot()]
+
+    assert before == after == [1, 2, 3]
